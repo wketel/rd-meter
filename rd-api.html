@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="app-version" content="2.1">
-<title>RD-omzetting via NSGI-API v2.1</title>
+<meta name="app-version" content="2.2">
+<title>RD-omzetting via NSGI-API v2.2</title>
 <style>
 :root{--bg:#ffffff;--fg:#14181c;--mut:#5b646d;--card:#eef1f4;--line:#c9d0d6;--ok:#0a7a2f;--bad:#b3261e;--acc:#0b57d0}
 @media (prefers-color-scheme:dark){:root{--bg:#101316;--fg:#e8ecef;--mut:#98a2ab;--card:#1a1f24;--line:#303840;--ok:#5fd68a;--bad:#ff8a80;--acc:#8ab4f8}}
@@ -21,6 +21,7 @@ button,input{font:inherit;color:var(--fg);background:var(--bg);border:1px solid 
 button{background:var(--acc);color:#fff;border-color:var(--acc);font-weight:600}
 button.sec{background:var(--bg);color:var(--fg);border-color:var(--line)}
 input{width:100%}
+.secret{-webkit-text-security:disc;text-security:disc}
 .chk{display:flex;gap:8px;align-items:center;font-size:1rem;color:var(--fg);margin:0}
 .chk input{width:auto}
 label{display:block;font-size:.85rem;color:var(--mut);margin:6px 0 2px}
@@ -39,8 +40,9 @@ th:first-child,td:first-child{text-align:left}
 
 <div class="box">
   <label for="key">API-key (vraag aan bij de NSGI, blijft op dit apparaat)</label>
-  <input id="key" type="password" autocomplete="off" placeholder="Plak hier je API-key">
+  <input id="key" class="secret" type="text" name="nsgi-api-key" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Plak hier je API-key">
   <div class="btns"><button id="savekey" class="sec">Bewaar key</button></div>
+  <div id="keystat" class="sm"></div>
 </div>
 
 <div class="box">
@@ -97,7 +99,7 @@ th:first-child,td:first-child{text-align:left}
 
 <script>
 "use strict";
-const VERSION = "2.1";
+const VERSION = "2.2";
 const $ = id => document.getElementById(id);
 const URL_API = "https://api.transformation.nsgi.nl/v2/transform";
 const CRS_ETRS = "http://www.opengis.net/def/crs/EPSG/0/7931"; // ETRS89 geografisch 3D
@@ -139,7 +141,23 @@ function computeStats(obs) {
 /*ENDSTATS*/
 
 /* ---------- Instellingen ---------- */
-try { const k = localStorage.getItem("nsgi_key"); if (k) $("key").value = k; } catch (e) {}
+function loadKey() {
+  try {
+    const k = localStorage.getItem("nsgi_key");
+    if (k) { $("key").value = k; $("keystat").textContent = "Key geladen uit opslag (" + k.length + " tekens)"; $("keystat").className = "sm ok"; }
+    else { $("keystat").textContent = "Geen opgeslagen key gevonden"; $("keystat").className = "sm"; }
+  } catch (e) { $("keystat").textContent = "Opslag niet beschikbaar: key moet bij elke start opnieuw worden ingevuld"; $("keystat").className = "sm bad"; }
+}
+function saveKey() {
+  const k = $("key").value.trim();
+  try {
+    if (k) localStorage.setItem("nsgi_key", k); else localStorage.removeItem("nsgi_key");
+    $("keystat").textContent = k ? "Key bewaard (" + k.length + " tekens)" : "Key verwijderd uit opslag"; $("keystat").className = "sm ok";
+  } catch (e) { $("keystat").textContent = "Bewaren niet mogelijk; de key blijft alleen zolang de pagina open is"; $("keystat").className = "sm bad"; }
+}
+loadKey();
+window.addEventListener("pageshow", () => { if (!$("key").value) loadKey(); });
+$("key").addEventListener("input", saveKey);
 try {
   const s = JSON.parse(localStorage.getItem("nsgi_set") || "{}");
   if (s.avg != null) $("avg").checked = s.avg;
@@ -156,10 +174,7 @@ $("avg").onchange = () => { saveSettings(); syncUI(); };
 ["n", "int", "maxacc"].forEach(k => $(k).addEventListener("change", saveSettings));
 syncUI();
 
-$("savekey").onclick = () => {
-  try { localStorage.setItem("nsgi_key", $("key").value.trim()); $("msg").textContent = "Key bewaard"; $("msg").className = "sm ok"; }
-  catch (e) { $("msg").textContent = "Bewaren niet mogelijk; de key blijft alleen zolang de pagina open is"; $("msg").className = "sm bad"; }
-};
+$("savekey").onclick = saveKey;
 
 /* ---------- GNSS-positie ---------- */
 function finishSession() {
