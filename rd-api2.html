@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RD-omzetting via NSGI-API</title>
+<style>
+:root{--bg:#ffffff;--fg:#14181c;--mut:#5b646d;--card:#eef1f4;--line:#c9d0d6;--ok:#0a7a2f;--bad:#b3261e;--acc:#0b57d0}
+@media (prefers-color-scheme:dark){:root{--bg:#101316;--fg:#e8ecef;--mut:#98a2ab;--card:#1a1f24;--line:#303840;--ok:#5fd68a;--bad:#ff8a80;--acc:#8ab4f8}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,sans-serif;max-width:560px;margin-inline:auto}
+h1{font-size:1.1rem;margin:0 0 10px}
+.box{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:10px 12px;margin-bottom:10px}
+.row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:4px 0}
+.row span:first-child{color:var(--mut)}
+.big{font:600 2rem/1.1 ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+.sm{font:1rem ui-monospace,Menlo,Consolas,monospace}
+button,input{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px 12px}
+button{background:var(--acc);color:#fff;border-color:var(--acc);font-weight:600}
+button.sec{background:var(--bg);color:var(--fg);border-color:var(--line)}
+input{width:100%}
+label{display:block;font-size:.85rem;color:var(--mut);margin:6px 0 2px}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+pre{margin:6px 0 0;white-space:pre-wrap;word-break:break-all;font:.8rem ui-monospace,Menlo,monospace}
+summary{cursor:pointer;font-weight:600}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font:.85rem ui-monospace,Menlo,Consolas,monospace}
+th,td{padding:4px 6px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+</style>
+</head>
+<body>
+<h1>RD en NAP via de NSGI-API</h1>
+
+<div class="box">
+  <label for="key">API-key (vraag aan bij de NSGI, blijft op dit apparaat)</label>
+  <input id="key" type="password" autocomplete="off" placeholder="Plak hier je API-key">
+  <div class="btns"><button id="savekey" class="sec">Bewaar key</button></div>
+</div>
+
+<div class="box">
+  <label for="lat">Breedte ETRS89 (graden)</label><input id="lat" type="number" step="any" inputmode="decimal">
+  <label for="lon">Lengte ETRS89 (graden)</label><input id="lon" type="number" step="any" inputmode="decimal">
+  <label for="h">Ellipsoïdale hoogte (m)</label><input id="h" type="number" step="any" inputmode="decimal" value="0">
+  <label for="pole">Paalhoogte antenne (m, wordt van de hoogte afgetrokken)</label>
+  <input id="pole" type="number" step="0.001" value="0">
+  <div class="btns">
+    <button id="gps" class="sec">Neem huidige GNSS-positie</button>
+    <button id="go">Bereken via API</button>
+  </div>
+  <div id="gpsinfo" class="sm"></div>
+</div>
+
+<div class="box">
+  <div class="row"><span>X (RD)</span><span class="big" id="x">–</span></div>
+  <div class="row"><span>Y (RD)</span><span class="big" id="y">–</span></div>
+  <div class="row"><span>NAP-hoogte</span><span class="big" id="z">–</span></div>
+  <div id="msg" class="sm"></div>
+  <label for="nr">Puntnummer (pas aan om met een ander nummer verder te gaan)</label>
+  <input id="nr" type="text" value="1" autocomplete="off">
+  <div class="btns"><button id="save">Punt opslaan</button></div>
+</div>
+
+<div class="box">
+  <div class="row"><span>Opgeslagen punten</span><span class="sm" id="count">0</span></div>
+  <div class="scroll"><table id="tbl"></table></div>
+  <div class="btns">
+    <button id="copy" class="sec">Kopieer CSV</button>
+    <button id="dl" class="sec">Download CSV</button>
+    <button id="undo" class="sec">Verwijder laatste</button>
+    <button id="clear" class="sec">Wis alles</button>
+  </div>
+</div>
+
+<details class="box">
+  <summary>Technische details en ruw antwoord</summary>
+  <pre id="raw">Nog geen aanvraag gedaan.</pre>
+</details>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const URL_API = "https://api.transformation.nsgi.nl/v2/transform";
+let last = null, pts = [], curAcc = null;
+const CRS_ETRS = "http://www.opengis.net/def/crs/EPSG/0/7931"; // ETRS89 geografisch 3D
+const CRS_RD   = "http://www.opengis.net/def/crs/EPSG/0/7415"; // Amersfoort / RD New + NAP-hoogte
+
+try { const k = localStorage.getItem("nsgi_key"); if (k) $("key").value = k; } catch (e) {}
+$("savekey").onclick = () => {
+  try { localStorage.setItem("nsgi_key", $("key").value.trim()); $("msg").textContent = "Key bewaard"; $("msg").className = "sm ok"; }
+  catch (e) { $("msg").textContent = "Bewaren niet mogelijk; de key blijft alleen zolang de pagina open is"; $("msg").className = "sm bad"; }
+};
+
+$("gps").onclick = () => {
+  if (!navigator.geolocation) { $("gpsinfo").textContent = "Locatie niet beschikbaar in deze browser"; return; }
+  $("gpsinfo").textContent = "Positie ophalen…";
+  navigator.geolocation.getCurrentPosition(p => {
+    const c = p.coords;
+    last = null; curAcc = { h: c.accuracy, v: c.altitudeAccuracy }; $("lat").value = c.latitude; $("lon").value = c.longitude;
+    $("h").value = c.altitude == null ? "" : c.altitude;
+    $("gpsinfo").textContent = "Nauwkeurigheid volgens Android: " + (c.accuracy == null ? "onbekend" : c.accuracy.toFixed(3) + " m");
+  }, e => { $("gpsinfo").textContent = "Locatiefout: " + e.message; },
+  { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+};
+
+const f = (v, d) => typeof v === "number" && isFinite(v) ? v.toFixed(d) : "–";
+
+$("go").onclick = async () => {
+  const key = $("key").value.trim();
+  const lat = parseFloat($("lat").value), lon = parseFloat($("lon").value);
+  const hRaw = parseFloat($("h").value), pole = parseFloat($("pole").value) || 0;
+  const msg = $("msg"); msg.className = "sm";
+  if (!key) { msg.textContent = "Vul eerst je API-key in"; msg.className = "sm bad"; return; }
+  if (!isFinite(lat) || !isFinite(lon)) { msg.textContent = "Vul breedte en lengte in"; msg.className = "sm bad"; return; }
+  const h = (isFinite(hRaw) ? hRaw : 0) - pole;
+  const body = { type: "Feature", geometry: { type: "Point", coordinates: [lon, lat, h] }, properties: { id: 1 } };
+  msg.textContent = "Bezig met rekenen…";
+  $("raw").textContent = "POST " + URL_API + "\ncontent-crs: " + CRS_ETRS + "\naccept-crs: " + CRS_RD + "\n\n" + JSON.stringify(body);
+  try {
+    const r = await fetch(URL_API, {
+      method: "POST",
+      headers: { "accept": "application/json", "content-crs": CRS_ETRS, "accept-crs": CRS_RD, "apikey": key, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const text = await r.text();
+    $("raw").textContent += "\n\nHTTP " + r.status + "\n" + text;
+    if (!r.ok) { msg.textContent = "De API gaf fout " + r.status + ". Controleer je key en invoer."; msg.className = "sm bad"; return; }
+    const j = JSON.parse(text);
+    const feat = j.type === "FeatureCollection" ? j.features[0] : j;
+    const c = feat.geometry.coordinates;
+    $("x").textContent = f(c[0], 3); $("y").textContent = f(c[1], 3); $("z").textContent = f(c[2], 3);
+    last = { lat, lon, h, pole, x: c[0], y: c[1], z: c[2], accH: curAcc ? curAcc.h : null, accV: curAcc ? curAcc.v : null };
+    msg.textContent = "Klaar"; msg.className = "sm ok";
+  } catch (e) {
+    $("raw").textContent += "\n\nFout: " + e.message;
+    msg.textContent = "Aanvraag mislukt. Mogelijke oorzaken: geen internet, ongeldige key, of de API laat aanroepen vanuit een webpagina niet toe (CORS).";
+    msg.className = "sm bad";
+  }
+};
+
+/* ---------- Punten opslaan ---------- */
+function nextNr(s) {
+  const m = /^(.*?)(\d+)$/.exec(s.trim());
+  if (!m) return s.trim() + "1";
+  return m[1] + String(parseInt(m[2], 10) + 1).padStart(m[2].length, "0");
+}
+function persist() {
+  try { localStorage.setItem("nsgi_pts", JSON.stringify(pts)); localStorage.setItem("nsgi_nr", $("nr").value); } catch (e) {}
+}
+function render() {
+  const t = $("tbl"); t.textContent = "";
+  const head = t.insertRow();
+  ["Nr", "X", "Y", "NAP", "±H", "±V"].forEach(h => { const c = document.createElement("th"); c.textContent = h; head.appendChild(c); });
+  pts.forEach(p => {
+    const r = t.insertRow();
+    [p.nr, f(p.x, 3), f(p.y, 3), f(p.z, 3), f(p.accH, 3), f(p.accV, 3)].forEach(v => { r.insertCell().textContent = v; });
+  });
+  $("count").textContent = pts.length;
+}
+const opt = v => typeof v === "number" && isFinite(v) ? v.toFixed(3) : "";
+function csv() {
+  const clean = s => String(s).replace(/[;\r\n]/g, ",");
+  return "nr;tijd;breedte_etrs89;lengte_etrs89;h_ellipsoidaal_zonder_paal;paalhoogte;x_rd;y_rd;nap;nauwkeurigheid_horizontaal;nauwkeurigheid_verticaal\n" +
+    pts.map(p => [clean(p.nr), p.t, p.lat, p.lon, f(p.h + p.pole, 3), f(p.pole, 3), f(p.x, 3), f(p.y, 3), f(p.z, 3), opt(p.accH), opt(p.accV)].join(";")).join("\n");
+}
+try {
+  pts = JSON.parse(localStorage.getItem("nsgi_pts") || "[]");
+  const n = localStorage.getItem("nsgi_nr"); if (n) $("nr").value = n;
+} catch (e) { pts = []; }
+render();
+
+$("nr").addEventListener("input", persist);
+["lat", "lon", "h", "pole"].forEach(id => $(id).addEventListener("input", () => { last = null; }));
+["lat", "lon", "h"].forEach(id => $(id).addEventListener("input", () => { curAcc = null; }));
+
+$("save").onclick = () => {
+  const msg = $("msg");
+  if (!last) { msg.textContent = "Bereken eerst een punt via de API (invoer gewijzigd of al opgeslagen)"; msg.className = "sm bad"; return; }
+  const nr = $("nr").value.trim() || "1";
+  pts.push(Object.assign({ nr, t: new Date().toISOString() }, last));
+  $("nr").value = nextNr(nr);
+  last = null;
+  persist(); render();
+  msg.textContent = "Punt " + nr + " opgeslagen. Volgend nummer: " + $("nr").value; msg.className = "sm ok";
+};
+$("undo").onclick = () => {
+  if (!pts.length) return;
+  const p = pts.pop(); $("nr").value = p.nr; persist(); render();
+  $("msg").textContent = "Punt " + p.nr + " verwijderd"; $("msg").className = "sm";
+};
+$("clear").onclick = () => {
+  if (!pts.length || !confirm("Alle " + pts.length + " opgeslagen punten wissen?")) return;
+  pts = []; persist(); render();
+};
+$("copy").onclick = async () => {
+  try { await navigator.clipboard.writeText(csv()); $("msg").textContent = "CSV gekopieerd"; $("msg").className = "sm ok"; }
+  catch (e) { $("msg").textContent = "Kopiëren mislukt"; $("msg").className = "sm bad"; }
+};
+$("dl").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["\ufeff" + csv()], { type: "text/csv" }));
+  a.download = "punten-" + new Date().toISOString().slice(0, 10) + ".csv";
+  document.body.appendChild(a); a.click(); a.remove();
+};
+</script>
+</body>
+</html>
