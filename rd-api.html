@@ -3,13 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RD-omzetting via NSGI-API</title>
+<meta name="app-version" content="2.0">
+<title>RD-omzetting via NSGI-API v2.0</title>
 <style>
 :root{--bg:#ffffff;--fg:#14181c;--mut:#5b646d;--card:#eef1f4;--line:#c9d0d6;--ok:#0a7a2f;--bad:#b3261e;--acc:#0b57d0}
 @media (prefers-color-scheme:dark){:root{--bg:#101316;--fg:#e8ecef;--mut:#98a2ab;--card:#1a1f24;--line:#303840;--ok:#5fd68a;--bad:#ff8a80;--acc:#8ab4f8}}
 *{box-sizing:border-box}
 body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,sans-serif;max-width:560px;margin-inline:auto}
 h1{font-size:1.1rem;margin:0 0 10px}
+h1 small{color:var(--mut);font-weight:400}
 .box{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:10px 12px;margin-bottom:10px}
 .row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:4px 0}
 .row span:first-child{color:var(--mut)}
@@ -19,20 +21,38 @@ button,input{font:inherit;color:var(--fg);background:var(--bg);border:1px solid 
 button{background:var(--acc);color:#fff;border-color:var(--acc);font-weight:600}
 button.sec{background:var(--bg);color:var(--fg);border-color:var(--line)}
 input{width:100%}
+.chk{display:flex;gap:8px;align-items:center;font-size:1rem;color:var(--fg);margin:0}
+.chk input{width:auto}
 label{display:block;font-size:.85rem;color:var(--mut);margin:6px 0 2px}
 .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 .ok{color:var(--ok)}.bad{color:var(--bad)}
 pre{margin:6px 0 0;white-space:pre-wrap;word-break:break-all;font:.8rem ui-monospace,Menlo,monospace}
 summary{cursor:pointer;font-weight:600}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font:.85rem ui-monospace,Menlo,Consolas,monospace}
+th,td{padding:4px 6px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
 </style>
 </head>
 <body>
-<h1>RD en NAP via de NSGI-API</h1>
+<h1>RD en NAP via de NSGI-API <small id="ver"></small></h1>
 
 <div class="box">
   <label for="key">API-key (vraag aan bij de NSGI, blijft op dit apparaat)</label>
   <input id="key" type="password" autocomplete="off" placeholder="Plak hier je API-key">
   <div class="btns"><button id="savekey" class="sec">Bewaar key</button></div>
+</div>
+
+<div class="box">
+  <label class="chk"><input id="avg" type="checkbox"> Meerdere waarnemingen middelen</label>
+  <div id="avgopts">
+    <label for="n">Aantal waarnemingen per meting</label>
+    <input id="n" type="number" min="1" step="1" value="30" inputmode="numeric">
+    <label for="int">Minimale tijd tussen waarnemingen (s)</label>
+    <input id="int" type="number" min="0" step="0.5" value="1" inputmode="decimal">
+    <label for="maxacc">Max. nauwkeurigheid per waarneming volgens Android (m, 0 = niet filteren)</label>
+    <input id="maxacc" type="number" min="0" step="0.001" value="0" inputmode="decimal">
+  </div>
 </div>
 
 <div class="box">
@@ -53,6 +73,21 @@ summary{cursor:pointer;font-weight:600}
   <div class="row"><span>Y (RD)</span><span class="big" id="y">–</span></div>
   <div class="row"><span>NAP-hoogte</span><span class="big" id="z">–</span></div>
   <div id="msg" class="sm"></div>
+  <pre id="stat"></pre>
+  <label for="nr">Puntnummer (pas aan om met een ander nummer verder te gaan)</label>
+  <input id="nr" type="text" value="1" autocomplete="off">
+  <div class="btns"><button id="save">Punt opslaan</button></div>
+</div>
+
+<div class="box">
+  <div class="row"><span>Opgeslagen punten</span><span class="sm" id="count">0</span></div>
+  <div class="scroll"><table id="tbl"></table></div>
+  <div class="btns">
+    <button id="copy" class="sec">Kopieer CSV</button>
+    <button id="dl" class="sec">Download CSV</button>
+    <button id="undo" class="sec">Verwijder laatste</button>
+    <button id="clear" class="sec">Wis alles</button>
+  </div>
 </div>
 
 <details class="box">
@@ -62,31 +97,130 @@ summary{cursor:pointer;font-weight:600}
 
 <script>
 "use strict";
+const VERSION = "2.0";
 const $ = id => document.getElementById(id);
 const URL_API = "https://api.transformation.nsgi.nl/v2/transform";
 const CRS_ETRS = "http://www.opengis.net/def/crs/EPSG/0/7931"; // ETRS89 geografisch 3D
 const CRS_RD   = "http://www.opengis.net/def/crs/EPSG/0/7415"; // Amersfoort / RD New + NAP-hoogte
+let last = null, pts = [], curAcc = null, curStat = null, sess = null;
+const f = (v, d) => typeof v === "number" && isFinite(v) ? v.toFixed(d) : "–";
+const opt = v => typeof v === "number" && isFinite(v) ? v.toFixed(3) : "";
+$("ver").textContent = "v" + VERSION;
 
+/*STATS*/
+/* Middeling van waarnemingen: robuuste uitbijterverwerping (3 x MAD-sigma t.o.v. de mediaan,
+   minimaal 5 mm), daarna gemiddelde en steekproef-standaardafwijking in een lokaal E/N/U-stelsel. */
+const GA = 6378137, GE2 = 0.00669438002290;
+const med = a => { const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+const sd = a => a.length < 2 ? null : Math.sqrt(a.reduce((s, v) => s + (v - mean(a)) ** 2, 0) / (a.length - 1));
+const rsig = a => Math.max(1.4826 * med(a.map(v => Math.abs(v - med(a)))), 0.005);
+function computeStats(obs) {
+  const lat0 = obs[0].lat, lon0 = obs[0].lon, ph = lat0 * Math.PI / 180, sp = Math.sin(ph), W = Math.sqrt(1 - GE2 * sp * sp);
+  const kN = GA * (1 - GE2) / (W * W * W) * Math.PI / 180, kE = GA / W * Math.cos(ph) * Math.PI / 180;
+  const first = obs.find(o => o.h != null), h0 = first ? first.h : null;
+  const P = obs.map(o => ({ e: (o.lon - lon0) * kE, n: (o.lat - lat0) * kN, u: (o.h == null || h0 == null) ? null : o.h - h0, o }));
+  const allE = P.map(p => p.e), allN = P.map(p => p.n), allU = P.filter(p => p.u != null).map(p => p.u);
+  const mE = med(allE), mN = med(allN), mU = allU.length ? med(allU) : 0;
+  const sE = rsig(allE), sN = rsig(allN), sU = allU.length ? rsig(allU) : 0;
+  let keep = P.filter(p => Math.abs(p.e - mE) <= 3 * sE && Math.abs(p.n - mN) <= 3 * sN && (p.u == null || Math.abs(p.u - mU) <= 3 * sU));
+  if (keep.length < Math.min(2, P.length)) keep = P;
+  const E = keep.map(p => p.e), N = keep.map(p => p.n), U = keep.filter(p => p.u != null).map(p => p.u);
+  const aH = keep.map(p => p.o.aH).filter(v => v != null), aV = keep.map(p => p.o.aV).filter(v => v != null);
+  const dE = sd(E), dN = sd(N), dU = sd(U);
+  return {
+    n: keep.length, nTot: obs.length, rej: obs.length - keep.length,
+    lat: lat0 + mean(N) / kN, lon: lon0 + mean(E) / kE, h: U.length ? h0 + mean(U) : null,
+    sE: dE, sN: dN, sU: dU, sH: dE == null ? null : Math.hypot(dE, dN),
+    aH: aH.length ? mean(aH) : null, aV: aV.length ? mean(aV) : null,
+    dur: (obs[obs.length - 1].ts - obs[0].ts) / 1000
+  };
+}
+/*ENDSTATS*/
+
+/* ---------- Instellingen ---------- */
 try { const k = localStorage.getItem("nsgi_key"); if (k) $("key").value = k; } catch (e) {}
+try {
+  const s = JSON.parse(localStorage.getItem("nsgi_set") || "{}");
+  if (s.avg != null) $("avg").checked = s.avg;
+  ["n", "int", "maxacc"].forEach(k => { if (s[k] != null) $(k).value = s[k]; });
+} catch (e) {}
+function saveSettings() {
+  try { localStorage.setItem("nsgi_set", JSON.stringify({ avg: $("avg").checked, n: $("n").value, int: $("int").value, maxacc: $("maxacc").value })); } catch (e) {}
+}
+function syncUI() {
+  $("avgopts").style.display = $("avg").checked ? "block" : "none";
+  $("gps").textContent = sess ? "Stop meting" : ($("avg").checked ? "Start meting (gemiddelde)" : "Neem huidige GNSS-positie");
+}
+$("avg").onchange = () => { saveSettings(); syncUI(); };
+["n", "int", "maxacc"].forEach(k => $(k).addEventListener("change", saveSettings));
+syncUI();
+
 $("savekey").onclick = () => {
   try { localStorage.setItem("nsgi_key", $("key").value.trim()); $("msg").textContent = "Key bewaard"; $("msg").className = "sm ok"; }
   catch (e) { $("msg").textContent = "Bewaren niet mogelijk; de key blijft alleen zolang de pagina open is"; $("msg").className = "sm bad"; }
 };
 
+/* ---------- GNSS-positie ---------- */
+function finishSession() {
+  if (!sess) return;
+  navigator.geolocation.clearWatch(sess.id);
+  const s = sess; sess = null; syncUI();
+  if (!s.obs.length) { $("gpsinfo").textContent = "Meting gestopt zonder waarnemingen"; return; }
+  const st = computeStats(s.obs);
+  last = null; curAcc = { h: st.aH, v: st.aV }; curStat = st;
+  $("lat").value = st.lat.toFixed(10); $("lon").value = st.lon.toFixed(10); $("h").value = st.h == null ? "" : st.h.toFixed(4);
+  $("gpsinfo").textContent = "Gemiddelde van " + st.n + " van " + st.nTot + " waarnemingen (" + st.rej + " verworpen)";
+  if ($("key").value.trim()) $("go").click();
+  else { $("msg").textContent = "Vul je API-key in en tik op Bereken via API"; $("msg").className = "sm bad"; }
+}
+function onEpoch(p) {
+  const s = sess; if (!s) return;
+  const c = p.coords, ts = p.timestamp;
+  if (ts === s.lastTs) return;
+  s.lastTs = ts;
+  if (s.maxA > 0 && c.accuracy > s.maxA) s.skip++;
+  else if (s.keepT != null && ts - s.keepT < s.gap * 0.9) return;
+  else { s.keepT = ts; s.obs.push({ lat: c.latitude, lon: c.longitude, h: c.altitude, aH: c.accuracy, aV: c.altitudeAccuracy, ts }); }
+  $("gpsinfo").textContent = "Waarneming " + s.obs.length + " van " + s.N + (s.skip ? " (" + s.skip + " overgeslagen: nauwkeurigheid te laag)" : "") + " · Android ±" + f(c.accuracy, 3) + " m";
+  if (s.obs.length >= s.N) finishSession();
+}
 $("gps").onclick = () => {
+  if (sess) { finishSession(); return; }
   if (!navigator.geolocation) { $("gpsinfo").textContent = "Locatie niet beschikbaar in deze browser"; return; }
+  const geo = { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 };
+  if ($("avg").checked) {
+    saveSettings();
+    sess = { N: Math.max(1, parseInt($("n").value, 10) || 30), gap: Math.max(0, parseFloat($("int").value) || 0) * 1000,
+             maxA: parseFloat($("maxacc").value) || 0, obs: [], skip: 0, lastTs: null, keepT: null, id: null };
+    syncUI(); $("gpsinfo").textContent = "Wachten op eerste waarneming…";
+    sess.id = navigator.geolocation.watchPosition(onEpoch, e => {
+      $("gpsinfo").textContent = "Locatiefout: " + e.message;
+      if (e.code === 1 && sess) { navigator.geolocation.clearWatch(sess.id); sess = null; syncUI(); }
+    }, geo);
+    return;
+  }
   $("gpsinfo").textContent = "Positie ophalen…";
   navigator.geolocation.getCurrentPosition(p => {
     const c = p.coords;
+    last = null; curStat = null; curAcc = { h: c.accuracy, v: c.altitudeAccuracy };
     $("lat").value = c.latitude; $("lon").value = c.longitude;
     $("h").value = c.altitude == null ? "" : c.altitude;
     $("gpsinfo").textContent = "Nauwkeurigheid volgens Android: " + (c.accuracy == null ? "onbekend" : c.accuracy.toFixed(3) + " m");
-  }, e => { $("gpsinfo").textContent = "Locatiefout: " + e.message; },
-  { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+  }, e => { $("gpsinfo").textContent = "Locatiefout: " + e.message; }, geo);
 };
 
-const f = (v, d) => typeof v === "number" && isFinite(v) ? v.toFixed(d) : "–";
-
+/* ---------- API-aanvraag ---------- */
+function renderStat() {
+  const st = last && last.st;
+  if (!st) { $("stat").textContent = ""; return; }
+  const se = v => v == null ? null : v / Math.sqrt(st.n);
+  $("stat").textContent =
+    "n = " + st.n + " van " + st.nTot + " (" + st.rej + " verworpen), duur " + f(st.dur, 0) + " s\n" +
+    "Spreiding per waarneming (σ): E " + f(st.sE, 3) + " · N " + f(st.sN, 3) + " · H " + f(st.sH, 3) + " · U " + f(st.sU, 3) + " m\n" +
+    "Standaardfout gemiddelde (σ/√n): H " + f(se(st.sH), 3) + " · U " + f(se(st.sU), 3) + " m\n" +
+    "Let op: opeenvolgende RTK-waarnemingen zijn gecorreleerd, de werkelijke onzekerheid is groter dan σ/√n.";
+}
 $("go").onclick = async () => {
   const key = $("key").value.trim();
   const lat = parseFloat($("lat").value), lon = parseFloat($("lon").value);
@@ -111,12 +245,82 @@ $("go").onclick = async () => {
     const feat = j.type === "FeatureCollection" ? j.features[0] : j;
     const c = feat.geometry.coordinates;
     $("x").textContent = f(c[0], 3); $("y").textContent = f(c[1], 3); $("z").textContent = f(c[2], 3);
+    last = { lat, lon, h, pole, x: c[0], y: c[1], z: c[2], accH: curAcc ? curAcc.h : null, accV: curAcc ? curAcc.v : null, st: curStat };
+    renderStat();
     msg.textContent = "Klaar"; msg.className = "sm ok";
   } catch (e) {
     $("raw").textContent += "\n\nFout: " + e.message;
     msg.textContent = "Aanvraag mislukt. Mogelijke oorzaken: geen internet, ongeldige key, of de API laat aanroepen vanuit een webpagina niet toe (CORS).";
     msg.className = "sm bad";
   }
+};
+
+/* ---------- Punten opslaan ---------- */
+function nextNr(s) {
+  const m = /^(.*?)(\d+)$/.exec(s.trim());
+  if (!m) return s.trim() + "1";
+  return m[1] + String(parseInt(m[2], 10) + 1).padStart(m[2].length, "0");
+}
+function persist() {
+  try { localStorage.setItem("nsgi_pts", JSON.stringify(pts)); localStorage.setItem("nsgi_nr", $("nr").value); } catch (e) {}
+}
+function render() {
+  const t = $("tbl"); t.textContent = "";
+  const head = t.insertRow();
+  ["Nr", "X", "Y", "NAP", "±H", "±V", "n", "σH", "σU"].forEach(h => { const c = document.createElement("th"); c.textContent = h; head.appendChild(c); });
+  pts.forEach(p => {
+    const st = p.st || {}, r = t.insertRow();
+    [p.nr, f(p.x, 3), f(p.y, 3), f(p.z, 3), f(p.accH, 3), f(p.accV, 3), p.st ? st.n : 1, f(st.sH, 3), f(st.sU, 3)]
+      .forEach(v => { r.insertCell().textContent = v; });
+  });
+  $("count").textContent = pts.length;
+}
+function csv() {
+  const clean = s => String(s).replace(/[;\r\n]/g, ",");
+  return "app_versie;nr;tijd;breedte_etrs89;lengte_etrs89;h_ellipsoidaal_zonder_paal;paalhoogte;x_rd;y_rd;nap;" +
+    "nauwkeurigheid_android_h;nauwkeurigheid_android_v;n_gebruikt;n_totaal;n_verworpen;sigma_e;sigma_n;sigma_h;sigma_u;duur_s\n" +
+    pts.map(p => { const st = p.st || {}; return [p.ver || "1.x", clean(p.nr), p.t, p.lat, p.lon, f(p.h + p.pole, 3), f(p.pole, 3),
+      f(p.x, 3), f(p.y, 3), f(p.z, 3), opt(p.accH), opt(p.accV),
+      p.st ? st.n : 1, p.st ? st.nTot : 1, p.st ? st.rej : 0, opt(st.sE), opt(st.sN), opt(st.sH), opt(st.sU), p.st ? f(st.dur, 0) : ""].join(";"); }).join("\n");
+}
+try {
+  pts = JSON.parse(localStorage.getItem("nsgi_pts") || "[]");
+  const n = localStorage.getItem("nsgi_nr"); if (n) $("nr").value = n;
+} catch (e) { pts = []; }
+render();
+
+$("nr").addEventListener("input", persist);
+["lat", "lon", "h", "pole"].forEach(id => $(id).addEventListener("input", () => { last = null; renderStat(); }));
+["lat", "lon", "h"].forEach(id => $(id).addEventListener("input", () => { curAcc = null; curStat = null; }));
+
+$("save").onclick = () => {
+  const msg = $("msg");
+  if (!last) { msg.textContent = "Bereken eerst een punt via de API (invoer gewijzigd of al opgeslagen)"; msg.className = "sm bad"; return; }
+  const nr = $("nr").value.trim() || "1";
+  pts.push(Object.assign({ nr, t: new Date().toISOString(), ver: VERSION }, last));
+  $("nr").value = nextNr(nr);
+  last = null;
+  persist(); render();
+  msg.textContent = "Punt " + nr + " opgeslagen. Volgend nummer: " + $("nr").value; msg.className = "sm ok";
+};
+$("undo").onclick = () => {
+  if (!pts.length) return;
+  const p = pts.pop(); $("nr").value = p.nr; persist(); render();
+  $("msg").textContent = "Punt " + p.nr + " verwijderd"; $("msg").className = "sm";
+};
+$("clear").onclick = () => {
+  if (!pts.length || !confirm("Alle " + pts.length + " opgeslagen punten wissen?")) return;
+  pts = []; persist(); render();
+};
+$("copy").onclick = async () => {
+  try { await navigator.clipboard.writeText(csv()); $("msg").textContent = "CSV gekopieerd"; $("msg").className = "sm ok"; }
+  catch (e) { $("msg").textContent = "Kopiëren mislukt"; $("msg").className = "sm bad"; }
+};
+$("dl").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["\ufeff" + csv()], { type: "text/csv" }));
+  a.download = "punten-" + new Date().toISOString().slice(0, 10) + ".csv";
+  document.body.appendChild(a); a.click(); a.remove();
 };
 </script>
 </body>
